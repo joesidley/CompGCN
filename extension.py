@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import torch.sparse as sparse
 import wandb
 import os
 
@@ -79,7 +80,93 @@ class GCNLayer(nn.Module):
         out = out / neighbor_counts.unsqueeze(1)
         
         return torch.relu(out)
+class ConvEOperator(nn.Module):
+    def __init__(self, embedding_dim, num_filters=32, kernel_size=3):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.height = int(np.sqrt(embedding_dim))
+        self.width = self.height
+        
+        assert self.height * self.width == embedding_dim, "Embedding dimension must be a perfect square"
+        
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, num_filters, kernel_size, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(num_filters),
+            nn.Dropout(0.2)
+        )
+        
+        conv_output_size = num_filters * self.height * self.width
+        
+        self.fc = nn.Sequential(
+            nn.Linear(conv_output_size, embedding_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(embedding_dim),
+            nn.Dropout(0.2)
+        )
+        
+        nn.init.xavier_uniform_(self.conv[0].weight)
+        nn.init.zeros_(self.conv[0].bias)
+        nn.init.xavier_uniform_(self.fc[0].weight)
+        nn.init.zeros_(self.fc[0].bias)
+        
+        self.conv[0].weight.data *= 0.1
+        self.fc[0].weight.data *= 0.1
+    
+    def forward(self, h, r):
+        batch_size = h.size(0) if h.dim() > 1 else 1
+        
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+            r = r.unsqueeze(0)
+        
+        h = h.view(batch_size, 1, self.height, self.width)
+        r = r.view(batch_size, 1, self.height, self.width)
+        
+        x = torch.cat([h, r], dim=1)
+        x = self.conv(x)
+        x = x.view(batch_size, -1)
+        x = self.fc(x)  
+        
+        return x.squeeze(0) if batch_size == 1 else x
 
+class NTNOperator(nn.Module):
+    def __init__(self, embedding_dim, num_slices=4):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.num_slices = min(num_slices, embedding_dim // 4) 
+        
+        self.W = nn.Parameter(torch.randn(self.num_slices, embedding_dim, embedding_dim))
+        self.V = nn.Parameter(torch.randn(self.num_slices, 2 * embedding_dim))
+        self.b = nn.Parameter(torch.zeros(self.num_slices))
+        
+        self.projection = nn.Linear(self.num_slices, embedding_dim)
+        
+        nn.init.xavier_uniform_(self.W)
+        nn.init.xavier_uniform_(self.V)
+        nn.init.xavier_uniform_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        
+
+        self.W.data *= 0.01
+        self.V.data *= 0.01
+        self.projection.weight.data *= 0.01
+    
+    def forward(self, h, r):
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+            r = r.unsqueeze(0)
+            
+        batch_size = h.size(0)
+        bilinear = torch.einsum('bi,sij,bj->bs', h, self.W, r)
+        concat = torch.cat([h, r], dim=1)
+        linear = torch.matmul(concat, self.V.t())
+        hidden = torch.tanh(bilinear + linear + self.b)
+        result = self.projection(hidden)
+        
+        if batch_size == 1:
+            result = result.squeeze(0)
+        return result
 class CompositionalOperator:
     @staticmethod
     def subtraction(h, r):
@@ -119,11 +206,16 @@ class GCN(nn.Module):
         nn.init.xavier_uniform_(self.node_embedding.weight)
         nn.init.xavier_uniform_(self.relation_embedding.weight)
         
-        self.composition = {
-            'circular_correlation': CompositionalOperator.circular_correlation,
-            'subtraction': CompositionalOperator.subtraction,
-            'multiplication': CompositionalOperator.multiplication
-        }[composition]
+        if composition == 'conve':
+            self.composition = ConvEOperator(in_features).to(device)
+        elif composition == 'ntn':
+            self.composition = NTNOperator(in_features).to(device)
+        else:
+            self.composition = {
+                'circular_correlation': CompositionalOperator.circular_correlation,
+                'subtraction': CompositionalOperator.subtraction,
+                'multiplication': CompositionalOperator.multiplication
+            }[composition]
         
         self.skip1 = nn.Linear(in_features, hidden_features)
         self.skip2 = nn.Linear(hidden_features, out_features)
@@ -212,6 +304,10 @@ def format_metrics(metrics):
     return f'MRR: {metrics["mrr"]:.4f}, MR: {metrics["mr"]:.1f}, H@10: {metrics["h10"]:.4f}, H@3: {metrics["h3"]:.4f}, H@1: {metrics["h1"]:.4f}'
 
 def train(model, train_edges, valid_edges, num_nodes, num_epochs=1000, learning_rate=0.001, batch_size=16192):
+    if isinstance(model.composition, type):
+        composition_name = model.composition.__class__.__name__
+    else:
+        composition_name = model.composition.__name__ if hasattr(model.composition, '__name__') else model.composition.__class__.__name__
     wandb.finish()
     wandb.login(key="ADD KEY HERE")
     wandb.init(project="knowledge-graph-gcn", config={
@@ -220,7 +316,7 @@ def train(model, train_edges, valid_edges, num_nodes, num_epochs=1000, learning_
         "num_epochs": num_epochs,
         "num_nodes": num_nodes,
         "model_type": model.__class__.__name__,
-        "composition": model.composition.__name__,
+        "composition": composition_name,
         "device": device.type
     })
     
