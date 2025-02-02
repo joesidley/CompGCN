@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import torch.sparse as sparse
 import wandb
 import os
 
@@ -49,33 +48,72 @@ def init_dataset(dataset_type='WN18RR'):
         edge[1] for edge in train_raw
     )))}
     
-    valid_edges = [(node_mapping[src], rel_mapping[rel], node_mapping[dst]) 
-                   for src, rel, dst in valid_raw 
-                   if src in node_mapping and dst in node_mapping and rel in rel_mapping]
+    ORIGINAL_OFFSET = 0
+    INVERSE_OFFSET = num_relations
+    SELF_LOOP_OFFSET = 2 * num_relations
     
-    test_edges = [(node_mapping[src], rel_mapping[rel], node_mapping[dst]) 
-                  for src, rel, dst in test_raw 
-                  if src in node_mapping and dst in node_mapping and rel in rel_mapping]
+    processed_train = []
+    for src, rel, dst in train_remapped:
+        processed_train.append((src, rel + ORIGINAL_OFFSET, dst))
+        processed_train.append((dst, rel + INVERSE_OFFSET, src))
     
-    return train_remapped, valid_edges, test_edges, len(node_mapping), len(rel_mapping), rel_mapping
+    for node in range(num_nodes):
+        processed_train.append((node, SELF_LOOP_OFFSET, node))
+    
+    valid_edges = []
+    for src, rel, dst in valid_raw:
+        if src in node_mapping and dst in node_mapping and rel in rel_mapping:
+            valid_edges.append((node_mapping[src], rel_mapping[rel] + ORIGINAL_OFFSET, node_mapping[dst]))
+    
+    test_edges = []
+    for src, rel, dst in test_raw:
+        if src in node_mapping and dst in node_mapping and rel in rel_mapping:
+            test_edges.append((node_mapping[src], rel_mapping[rel] + ORIGINAL_OFFSET, node_mapping[dst]))
+    
+    total_relation_types = 2 * num_relations + 1
+    return processed_train, valid_edges, test_edges, num_nodes, total_relation_types, rel_mapping
 
 class GCNLayer(nn.Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features, out_features, num_relations):
         super(GCNLayer, self).__init__()
-        self.linear = nn.Linear(in_features, out_features)
+        self.num_relations = num_relations
+  
+        self.linear_original = nn.Linear(in_features, out_features)
+        self.linear_inverse = nn.Linear(in_features, out_features)
+        self.linear_self_loop = nn.Linear(in_features, out_features)
         
-    def forward(self, x, edge_index, edge_features):
+    def forward(self, x, edge_index, edge_types):
         src_nodes, dst_nodes = edge_index
         src_features = x[src_nodes]
-        messages = self.linear(src_features)
         
-        out = torch.zeros((x.shape[0], self.linear.out_features), 
+
+        out = torch.zeros((x.shape[0], self.linear_original.out_features), 
                          device=x.device, 
-                         dtype=messages.dtype)
-        out.index_add_(0, dst_nodes, messages)
+                         dtype=src_features.dtype)  
         
-        neighbor_counts = torch.zeros(x.shape[0], device=x.device, dtype=messages.dtype)
-        neighbor_counts.index_add_(0, dst_nodes, torch.ones_like(dst_nodes, dtype=messages.dtype))
+           
+        original_mask = edge_types < self.num_relations
+        inverse_mask = (edge_types >= self.num_relations) & (edge_types < 2 * self.num_relations)
+        self_loop_mask = edge_types >= 2 * self.num_relations
+        
+        
+        if torch.any(original_mask):
+            orig_messages = self.linear_original(src_features[original_mask])
+            out.index_add_(0, dst_nodes[original_mask], orig_messages)
+        
+       
+        if torch.any(inverse_mask):
+            inv_messages = self.linear_inverse(src_features[inverse_mask])
+            out.index_add_(0, dst_nodes[inverse_mask], inv_messages)
+        
+
+        if torch.any(self_loop_mask):
+            self_messages = self.linear_self_loop(src_features[self_loop_mask])
+            out.index_add_(0, dst_nodes[self_loop_mask], self_messages)
+        
+
+        neighbor_counts = torch.zeros(x.shape[0], device=x.device, dtype=src_features.dtype)
+        neighbor_counts.index_add_(0, dst_nodes, torch.ones_like(dst_nodes, dtype=src_features.dtype))
         neighbor_counts = torch.clamp(neighbor_counts, min=1)
         out = out / neighbor_counts.unsqueeze(1)
         
@@ -193,16 +231,19 @@ class GCN(nn.Module):
     def __init__(self, num_nodes, num_relations, in_features, hidden_features, out_features, 
                  composition='circular_correlation', dropout=0.2):
         super(GCN, self).__init__()
+     
+        self.num_base_relations = num_relations // 2 
         self.node_embedding = nn.Embedding(num_nodes, in_features)
-        self.relation_embedding = nn.Embedding(num_relations, in_features)
+        self.relation_embedding = nn.Embedding(num_relations, in_features)  
         
-        self.gcn1 = GCNLayer(in_features, hidden_features)
-        self.gcn2 = GCNLayer(hidden_features, out_features)
+        self.gcn1 = GCNLayer(in_features, hidden_features, num_relations)
+        self.gcn2 = GCNLayer(hidden_features, out_features, num_relations)
         
         self.layer_norm1 = nn.LayerNorm(hidden_features)
         self.layer_norm2 = nn.LayerNorm(out_features)
         self.dropout = nn.Dropout(dropout)
         
+
         nn.init.xavier_uniform_(self.node_embedding.weight)
         nn.init.xavier_uniform_(self.relation_embedding.weight)
         
@@ -220,26 +261,50 @@ class GCN(nn.Module):
         self.skip1 = nn.Linear(in_features, hidden_features)
         self.skip2 = nn.Linear(hidden_features, out_features)
 
-    def score_triplet(self, head_emb, rel_emb, tail_emb):
-        composed = self.composition(head_emb, rel_emb)
-        return torch.sum(composed * tail_emb, dim=-1)
+    def get_relation_embedding(self, rel_indices):
+        original_mask = rel_indices < self.num_base_relations
+        inverse_mask = (rel_indices >= self.num_base_relations) & (rel_indices < 2 * self.num_base_relations)
+        self_loop_mask = rel_indices >= 2 * self.num_base_relations
+        
+        embeddings = torch.zeros((rel_indices.size(0), self.relation_embedding.embedding_dim),
+                               device=rel_indices.device)
+        
+        if torch.any(original_mask):
+            embeddings[original_mask] = self.relation_embedding(rel_indices[original_mask])
+        if torch.any(inverse_mask):
+            inv_indices = rel_indices[inverse_mask] - self.num_base_relations
+            embeddings[inverse_mask] = self.relation_embedding(inv_indices)
+        if torch.any(self_loop_mask):
+            embeddings[self_loop_mask] = self.relation_embedding(torch.zeros_like(rel_indices[self_loop_mask]))
+        
+        return embeddings
 
     def forward(self, edges):
         node_features = self.node_embedding.weight
         edge_index = edges[:, [0, 2]].t()
-        edge_features = self.relation_embedding(edges[:, 1])
+        edge_types = edges[:, 1]
         
-        x1 = self.gcn1(node_features, edge_index, edge_features)
+        x1 = self.gcn1(node_features, edge_index, edge_types)
         x1 = x1 + self.skip1(node_features)
         x1 = self.layer_norm1(x1)
         x1 = self.dropout(x1)
         
-        x2 = self.gcn2(x1, edge_index, edge_features)
+        x2 = self.gcn2(x1, edge_index, edge_types)
         x2 = x2 + self.skip2(x1)
         x2 = self.layer_norm2(x2)
         x2 = self.dropout(x2)
         
         return x2
+
+    def score_triplet(self, head_emb, rel_emb, tail_emb):
+
+        if isinstance(rel_emb, torch.Tensor) and rel_emb.dim() > 1:
+            rel_type = torch.div(rel_emb, self.num_base_relations, rounding_mode='floor')
+            mask = (rel_type == 0).float().unsqueeze(-1)
+            rel_emb = rel_emb * mask
+        
+        composed = self.composition(head_emb, rel_emb)
+        return torch.sum(composed * tail_emb, dim=-1)
 
 def compute_ranks(model, eval_edges, train_edges, num_nodes, batch_size=4096):
     model.eval()
@@ -303,7 +368,7 @@ def evaluate(model, eval_edges, train_edges, num_nodes, return_dict=False):
 def format_metrics(metrics):
     return f'MRR: {metrics["mrr"]:.4f}, MR: {metrics["mr"]:.1f}, H@10: {metrics["h10"]:.4f}, H@3: {metrics["h3"]:.4f}, H@1: {metrics["h1"]:.4f}'
 
-def train(model, train_edges, valid_edges, num_nodes, num_epochs=1000, learning_rate=0.001, batch_size=16192):
+def train(model, train_edges, valid_edges, num_nodes, num_epochs=500, learning_rate=0.001, batch_size=16192):
     if isinstance(model.composition, type):
         composition_name = model.composition.__class__.__name__
     else:
@@ -324,8 +389,6 @@ def train(model, train_edges, valid_edges, num_nodes, num_epochs=1000, learning_
     criterion = nn.BCEWithLogitsLoss(reduction='sum')
     train_edges = train_edges.to(device)
     valid_edges = valid_edges.to(device)
-    scaler = torch.cuda.amp.GradScaler()
-
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0.0
@@ -339,31 +402,29 @@ def train(model, train_edges, valid_edges, num_nodes, num_epochs=1000, learning_
             current_batch_size = len(batch_edges)
             
             optimizer.zero_grad()
-            with torch.amp.autocast("cuda"):
-                node_embeddings = model(batch_edges)
-                
-                src_embeds = node_embeddings[batch_edges[:, 0]]
-                rel_embeds = model.relation_embedding(batch_edges[:, 1])
-                dst_embeds = node_embeddings[batch_edges[:, 2]]
-                
-                composed_src = model.composition(src_embeds, rel_embeds)
-                pos_scores = torch.sum(composed_src * dst_embeds, dim=1)
-                
-                neg_dst = torch.randint(0, num_nodes, (current_batch_size,), device=device)
-                neg_dst_embeds = node_embeddings[neg_dst]
-                neg_scores = torch.sum(composed_src * neg_dst_embeds, dim=1)
-                
-                scores = torch.cat([pos_scores, neg_scores])
-                labels = torch.cat([
-                    torch.ones(current_batch_size, device=device),
-                    torch.zeros(current_batch_size, device=device)
-                ])
-                
-                loss = criterion(scores, labels)
+            node_embeddings = model(batch_edges)
             
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            src_embeds = node_embeddings[batch_edges[:, 0]]
+            rel_embeds = model.relation_embedding(batch_edges[:, 1])
+            dst_embeds = node_embeddings[batch_edges[:, 2]]
+            
+            composed_src = model.composition(src_embeds, rel_embeds)
+            pos_scores = torch.sum(composed_src * dst_embeds, dim=1)
+            
+            neg_dst = torch.randint(0, num_nodes, (current_batch_size,), device=device)
+            neg_dst_embeds = node_embeddings[neg_dst]
+            neg_scores = torch.sum(composed_src * neg_dst_embeds, dim=1)
+            
+            scores = torch.cat([pos_scores, neg_scores])
+            labels = torch.cat([
+                torch.ones(current_batch_size, device=device),
+                torch.zeros(current_batch_size, device=device)
+            ])
+            
+            loss = criterion(scores, labels)
+            
+            loss.backward()
+            optimizer.step()
             
             total_loss += loss.item() * current_batch_size
 
@@ -386,7 +447,7 @@ def train(model, train_edges, valid_edges, num_nodes, num_epochs=1000, learning_
     
     wandb.finish()
 
-def create_and_train_model(dataset_type='WN18RR', num_epochs=1000):
+def create_and_train_model(dataset_type='WN18RR', num_epochs=500):
     train_edges, valid_edges, test_edges, num_nodes, num_relations, rel_mapping = init_dataset(dataset_type)
     
     train_edges = torch.tensor(train_edges, dtype=torch.long)
