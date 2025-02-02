@@ -39,7 +39,6 @@ def init_dataset(dataset_type='WN18RR'):
     valid_raw = parse_data(f'/kaggle/input/{base_path}valid.txt', dataset_type)
     test_raw  = parse_data(f'/kaggle/input/{base_path}test.txt',  dataset_type)
     
-    # First remap edges to get the mappings
     train_remapped, num_nodes, num_relations, rel_mapping = remap_edges(train_raw)
     
     node_mapping = {node: idx for idx, node in enumerate(sorted(set(
@@ -49,24 +48,18 @@ def init_dataset(dataset_type='WN18RR'):
         edge[1] for edge in train_raw
     )))}
     
-    # Create edge type offsets
     ORIGINAL_OFFSET = 0
     INVERSE_OFFSET = num_relations
     SELF_LOOP_OFFSET = 2 * num_relations
     
-    # Process training edges with inverses and self-loops
     processed_train = []
-    # Add original edges
     for src, rel, dst in train_remapped:
         processed_train.append((src, rel + ORIGINAL_OFFSET, dst))
-        # Add inverse edges
         processed_train.append((dst, rel + INVERSE_OFFSET, src))
     
-    # Add self-loops for all nodes
     for node in range(num_nodes):
         processed_train.append((node, SELF_LOOP_OFFSET, node))
     
-    # Process validation and test edges
     valid_edges = []
     for src, rel, dst in valid_raw:
         if src in node_mapping and dst in node_mapping and rel in rel_mapping:
@@ -77,14 +70,14 @@ def init_dataset(dataset_type='WN18RR'):
         if src in node_mapping and dst in node_mapping and rel in rel_mapping:
             test_edges.append((node_mapping[src], rel_mapping[rel] + ORIGINAL_OFFSET, node_mapping[dst]))
     
-    total_relation_types = 2 * num_relations + 1  # original + inverse + self-loop
+    total_relation_types = 2 * num_relations + 1
     return processed_train, valid_edges, test_edges, num_nodes, total_relation_types, rel_mapping
 
 class GCNLayer(nn.Module):
     def __init__(self, in_features, out_features, num_relations):
         super(GCNLayer, self).__init__()
         self.num_relations = num_relations
-        # Create separate weight matrices for each edge type
+  
         self.linear_original = nn.Linear(in_features, out_features)
         self.linear_inverse = nn.Linear(in_features, out_features)
         self.linear_self_loop = nn.Linear(in_features, out_features)
@@ -93,32 +86,32 @@ class GCNLayer(nn.Module):
         src_nodes, dst_nodes = edge_index
         src_features = x[src_nodes]
         
-        # Initialize output with same dtype as input
+
         out = torch.zeros((x.shape[0], self.linear_original.out_features), 
                          device=x.device, 
-                         dtype=src_features.dtype)  # Match input dtype
+                         dtype=src_features.dtype)  
         
-        # Split edges by type
+           
         original_mask = edge_types < self.num_relations
         inverse_mask = (edge_types >= self.num_relations) & (edge_types < 2 * self.num_relations)
         self_loop_mask = edge_types >= 2 * self.num_relations
         
-        # Process each edge type separately
+        
         if torch.any(original_mask):
             orig_messages = self.linear_original(src_features[original_mask])
             out.index_add_(0, dst_nodes[original_mask], orig_messages)
         
-        # Inverse edges
+       
         if torch.any(inverse_mask):
             inv_messages = self.linear_inverse(src_features[inverse_mask])
             out.index_add_(0, dst_nodes[inverse_mask], inv_messages)
         
-        # Self-loop edges
+
         if torch.any(self_loop_mask):
             self_messages = self.linear_self_loop(src_features[self_loop_mask])
             out.index_add_(0, dst_nodes[self_loop_mask], self_messages)
         
-        # Normalize using same dtype
+
         neighbor_counts = torch.zeros(x.shape[0], device=x.device, dtype=src_features.dtype)
         neighbor_counts.index_add_(0, dst_nodes, torch.ones_like(dst_nodes, dtype=src_features.dtype))
         neighbor_counts = torch.clamp(neighbor_counts, min=1)
@@ -152,10 +145,10 @@ class GCN(nn.Module):
     def __init__(self, num_nodes, num_relations, in_features, hidden_features, out_features, 
                  composition='circular_correlation', dropout=0.2):
         super(GCN, self).__init__()
-        # Adjust num_relations to account for original, inverse, and self-loop relations
-        self.num_base_relations = num_relations // 2  # Since num_relations now includes inverse relations
+     
+        self.num_base_relations = num_relations // 2 
         self.node_embedding = nn.Embedding(num_nodes, in_features)
-        self.relation_embedding = nn.Embedding(num_relations, in_features)  # This now includes all relation types
+        self.relation_embedding = nn.Embedding(num_relations, in_features)  
         
         self.gcn1 = GCNLayer(in_features, hidden_features, num_relations)
         self.gcn2 = GCNLayer(hidden_features, out_features, num_relations)
@@ -164,7 +157,7 @@ class GCN(nn.Module):
         self.layer_norm2 = nn.LayerNorm(out_features)
         self.dropout = nn.Dropout(dropout)
         
-        # Initialize all embeddings
+
         nn.init.xavier_uniform_(self.node_embedding.weight)
         nn.init.xavier_uniform_(self.relation_embedding.weight)
         
@@ -178,7 +171,6 @@ class GCN(nn.Module):
         self.skip2 = nn.Linear(hidden_features, out_features)
 
     def get_relation_embedding(self, rel_indices):
-        # Determine which embedding matrix to use based on relation type
         original_mask = rel_indices < self.num_base_relations
         inverse_mask = (rel_indices >= self.num_base_relations) & (rel_indices < 2 * self.num_base_relations)
         self_loop_mask = rel_indices >= 2 * self.num_base_relations
@@ -200,7 +192,6 @@ class GCN(nn.Module):
         node_features = self.node_embedding.weight
         edge_index = edges[:, [0, 2]].t()
         edge_types = edges[:, 1]
-        edge_features = self.get_relation_embedding(edge_types)
         
         x1 = self.gcn1(node_features, edge_index, edge_types)
         x1 = x1 + self.skip1(node_features)
@@ -215,7 +206,7 @@ class GCN(nn.Module):
         return x2
 
     def score_triplet(self, head_emb, rel_emb, tail_emb):
-        # Only use original relations for scoring (not inverse or self-loop)
+
         if isinstance(rel_emb, torch.Tensor) and rel_emb.dim() > 1:
             rel_type = torch.div(rel_emb, self.num_base_relations, rounding_mode='floor')
             mask = (rel_type == 0).float().unsqueeze(-1)
@@ -303,8 +294,6 @@ def train(model, train_edges, valid_edges, num_nodes, num_epochs=500, learning_r
     criterion = nn.BCEWithLogitsLoss(reduction='sum')
     train_edges = train_edges.to(device)
     valid_edges = valid_edges.to(device)
-    scaler = torch.amp.GradScaler('cuda')
-
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0.0
